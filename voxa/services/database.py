@@ -25,12 +25,14 @@ def _get_client() -> AsyncClient:
 class CustomerProfile:
     def __init__(self, data: dict[str, Any]) -> None:
         self.customer_id: str = data.get("customer_id", "")
-        self.name: str = data.get("name", "Client")
+        self.name: str = data.get("name") or "Client"
         self.phone: str = data.get("phone", "")
         self.language: str = data.get("language", "fr-FR")
         self.history: list[dict[str, Any]] = data.get("history", [])
         self.preferences: dict[str, Any] = data.get("preferences", {})
         self.raw: dict[str, Any] = data
+        # Unknown callers get a stub profile with only a phone number.
+        self.known: bool = bool(data.get("customer_id"))
 
     def to_context_prompt(self) -> str:
         history_lines = "\n".join(
@@ -38,7 +40,7 @@ class CustomerProfile:
             for h in self.history[-5:]  # last 5 interactions only
         )
         return (
-            f"Client : {self.name}\n"
+            f"Client : {self.name if self.known else 'inconnu (nouveau client)'}\n"
             f"Langue préférée : {self.language}\n"
             f"Historique récent :\n{history_lines or '  Aucun historique.'}"
         )

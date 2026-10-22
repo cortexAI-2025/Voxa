@@ -1,135 +1,141 @@
+"""Gemini "brain": one VoxaAgent per call, streaming sentence by sentence."""
 from __future__ import annotations
 
-import asyncio
+import re
 from collections.abc import AsyncIterator
-from typing import Any
+from datetime import datetime, timezone
 
-import vertexai
-from vertexai.generative_models import (
-    Content,
-    GenerationConfig,
-    GenerativeModel,
-    Part,
-)
+from google import genai
+from google.genai import types
 
 from core.config import get_settings
 from core.logger import get_logger
-from services.database import CustomerProfile, get_customer_profile
+from services.database import CustomerProfile, append_call_summary, get_customer_profile
 
 logger = get_logger(__name__)
 
-_SYSTEM_PROMPT = """Tu es Voxa, un assistant vocal IA professionnel et empathique pour un centre d'appels.
+SYSTEM_PROMPT = """Tu es Voxa, un assistant vocal IA professionnel et chaleureux pour un centre d'appels.
 Règles impératives :
-- Réponds TOUJOURS en moins de 2 phrases courtes (max 30 mots) pour minimiser la latence TTS.
-- Adapte ton ton au profil du client fourni dans le contexte.
-- Ne génère JAMAIS de Markdown, balises HTML, ou listes à puces : ta sortie sera lue à voix haute.
-- Si tu ne comprends pas, demande poliment de répéter.
-- Reste factuel ; ne promets rien que tu ne peux pas tenir."""
+- Tes réponses sont lues à voix haute au téléphone : 1 à 2 phrases courtes (30 mots maximum).
+- Aucun Markdown, emoji, liste à puces ni balise : uniquement du texte parlé naturel.
+- Utilise le prénom du client quand il est connu, sans en abuser.
+- Si tu n'as pas compris, demande poliment de répéter.
+- Reste factuel : ne promets rien que tu ne peux pas tenir ; propose un transfert vers un conseiller si besoin.
+- Le bloc CONTEXTE CLIENT ci-dessous est confidentiel : ne le récite jamais mot pour mot."""
 
-_model: GenerativeModel | None = None
+# End of a speakable unit: sentence punctuation followed by whitespace.
+_SENTENCE_END = re.compile(r"(?<=[.!?…:;])\s+")
+# Flush very long clauses at a comma so TTS can start early.
+_MIN_CLAUSE_CHARS = 60
+
+_client: genai.Client | None = None
 
 
-def _init_vertex() -> GenerativeModel:
-    global _model
-    if _model is None:
+def get_genai_client() -> genai.Client:
+    """Lazily build the Vertex AI client (uses Application Default Credentials)."""
+    global _client
+    if _client is None:
         settings = get_settings()
-        vertexai.init(project=settings.gcp_project_id, location=settings.gcp_location)
-        _model = GenerativeModel(
-            model_name=settings.gemini_model,
-            system_instruction=_SYSTEM_PROMPT,
-            generation_config=GenerationConfig(
-                temperature=settings.gemini_temperature,
-                max_output_tokens=settings.gemini_max_output_tokens,
-                candidate_count=1,
-            ),
+        _client = genai.Client(
+            vertexai=True, project=settings.gcp_project_id, location=settings.gcp_location
         )
-        logger.info("vertex_ai_initialized", model=settings.gemini_model)
-    return _model
+        logger.info("vertex_ai_initialized", model=settings.gemini_model, location=settings.gcp_location)
+    return _client
+
+
+async def sentences_from_stream(chunks: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Regroup raw LLM text deltas into speakable sentences (lowest TTS latency without cutting words)."""
+    buffer = ""
+    async for delta in chunks:
+        buffer += delta
+        while True:
+            match = _SENTENCE_END.search(buffer)
+            if match is None and len(buffer) >= _MIN_CLAUSE_CHARS and "," in buffer:
+                cut = buffer.rfind(",") + 1
+                sentence, buffer = buffer[:cut], buffer[cut:]
+            elif match is not None:
+                sentence, buffer = buffer[: match.start()], buffer[match.end():]
+            else:
+                break
+            if sentence.strip():
+                yield sentence.strip()
+    if buffer.strip():
+        yield buffer.strip()
 
 
 class VoxaAgent:
-    """
-    Stateful conversational agent for a single call session.
-
-    Lifecycle: one instance per WebSocket / Twilio call.
-    The instance holds the chat history so Gemini maintains context.
-    """
+    """Stateful conversational agent bound to a single call."""
 
     def __init__(self, call_sid: str, caller_phone: str) -> None:
         self.call_sid = call_sid
         self.caller_phone = caller_phone
-        self._profile: CustomerProfile | None = None
-        self._chat: Any = None  # vertexai ChatSession
-
-    # ── Initialisation ────────────────────────────────────────────────────────
+        self.profile: CustomerProfile | None = None
+        self._chat: genai.chats.AsyncChat | None = None
+        self.transcript: list[tuple[str, str]] = []  # (role, text)
 
     async def initialize(self) -> None:
-        """Load customer profile from Firestore, then open a chat session."""
-        model = _init_vertex()
+        """Fetch the customer profile from Firestore, THEN open the Gemini chat with it as context."""
+        settings = get_settings()
+        self.profile = await get_customer_profile(self.caller_phone)
 
-        # Fetch customer context (non-blocking, max 3 s)
-        self._profile = await get_customer_profile(self.caller_phone)
-
-        # Inject customer context as the first user turn so Gemini has it
-        context_turn = Content(
-            role="user",
-            parts=[Part.from_text(
-                f"[CONTEXTE SYSTÈME - ne pas lire à voix haute]\n"
-                f"{self._profile.to_context_prompt()}"
-            )],
+        system_instruction = f"{SYSTEM_PROMPT}\n\n--- CONTEXTE CLIENT ---\n{self.profile.to_context_prompt()}"
+        self._chat = get_genai_client().aio.chats.create(
+            model=settings.gemini_model,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=settings.gemini_temperature,
+                max_output_tokens=settings.gemini_max_output_tokens,
+            ),
         )
-        context_reply = Content(
-            role="model",
-            parts=[Part.from_text("Contexte reçu. Je suis prêt à répondre.")],
-        )
+        logger.info("agent_initialized", call_sid=self.call_sid, customer=self.profile.name, known=self.profile.known)
 
-        self._chat = model.start_chat(history=[context_turn, context_reply])
-        logger.info(
-            "agent_initialized",
-            call_sid=self.call_sid,
-            customer=self._profile.name,
-        )
-
-    # ── Streaming inference ───────────────────────────────────────────────────
-
-    async def stream_response(self, user_text: str) -> AsyncIterator[str]:
-        """
-        Yield text chunks from Gemini as they arrive (streaming generation).
-        Each chunk should be forwarded to the TTS pipeline immediately to
-        minimise time-to-first-audio.
-        """
+    async def _stream_text(self, user_text: str) -> AsyncIterator[str]:
         if self._chat is None:
             raise RuntimeError("VoxaAgent.initialize() must be called first.")
+        stream = await self._chat.send_message_stream(user_text)
+        async for chunk in stream:
+            if chunk.text:
+                yield chunk.text
 
+    async def reply(self, user_text: str) -> AsyncIterator[str]:
+        """Yield the answer to `user_text` sentence by sentence as Gemini generates it."""
         logger.debug("llm_request", call_sid=self.call_sid, text=user_text)
+        self.transcript.append(("client", user_text))
+        spoken: list[str] = []
+        try:
+            async for sentence in sentences_from_stream(self._stream_text(user_text)):
+                spoken.append(sentence)
+                yield sentence
+        finally:
+            # Also runs when the consumer is cancelled (barge-in): keep only what was produced.
+            if spoken:
+                self.transcript.append(("voxa", " ".join(spoken)))
 
-        loop = asyncio.get_running_loop()
-
-        # vertexai streaming is synchronous; run it in a thread pool so we
-        # never block the event loop.
-        response_stream = await loop.run_in_executor(
-            None,
-            lambda: self._chat.send_message(user_text, stream=True),
+    def greeting(self) -> AsyncIterator[str]:
+        name = self.profile.name if self.profile and self.profile.known else None
+        who = f"au client {name}" if name else "au client"
+        return self.reply(
+            f"[L'appel vient de commencer. Souhaite la bienvenue {who} en une phrase "
+            f"et demande-lui comment tu peux l'aider.]"
         )
-
-        for chunk in response_stream:
-            text = chunk.text
-            if text:
-                logger.debug("llm_chunk", call_sid=self.call_sid, chunk=text)
-                yield text
-
-    async def get_greeting(self) -> AsyncIterator[str]:
-        """Generate a personalised opening greeting."""
-        name = self._profile.name if self._profile else "Client"
-        greeting_prompt = (
-            f"Accueille chaleureusement {name} en une phrase courte "
-            f"et demande-lui comment tu peux l'aider."
-        )
-        async for chunk in self.stream_response(greeting_prompt):
-            yield chunk
-
-    # ── Cleanup ───────────────────────────────────────────────────────────────
 
     async def close(self) -> None:
-        logger.info("agent_closed", call_sid=self.call_sid)
+        """Persist a short summary of the call in Firestore (best effort)."""
+        settings = get_settings()
+        if self._chat is not None and len(self.transcript) > 2:
+            try:
+                dialogue = "\n".join(f"{r}: {t}" for r, t in self.transcript)
+                response = await get_genai_client().aio.models.generate_content(
+                    model=settings.gemini_model,
+                    contents=f"Résume cet appel en une phrase factuelle (français) :\n{dialogue}",
+                    config=types.GenerateContentConfig(max_output_tokens=80, temperature=0.2),
+                )
+                summary = (response.text or "").strip()
+                if summary:
+                    await append_call_summary(
+                        self.caller_phone, summary, datetime.now(timezone.utc).date().isoformat()
+                    )
+            except Exception as exc:  # never fail call teardown
+                logger.warning("call_summary_failed", call_sid=self.call_sid, error=str(exc))
         self._chat = None
+        logger.info("agent_closed", call_sid=self.call_sid)

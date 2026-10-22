@@ -1,29 +1,23 @@
 # Web framework
-fastapi==0.115.12
-uvicorn[standard]==0.34.2
-python-multipart==0.0.20
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.34,<1.0
+python-multipart>=0.0.20
 
 # Configuration & validation
-pydantic==2.11.4
-pydantic-settings==2.9.1
-python-dotenv==1.1.0
+pydantic>=2.11,<3.0
+pydantic-settings>=2.9,<3.0
 
-# Google Cloud / Vertex AI
-google-cloud-aiplatform==1.93.0
-google-cloud-firestore==2.20.2
-google-auth==2.40.1
-vertexai==1.93.0
+# Google Cloud: Vertex AI (Gemini), Firestore, Speech-to-Text, Text-to-Speech
+google-genai>=1.20  # Gemini on Vertex AI (replaces the deprecated vertexai.generative_models)
+google-cloud-firestore>=2.20
+google-cloud-speech>=2.31
+google-cloud-texttospeech>=2.26
 
-# Audio / WebSocket
-websockets==15.0.1
-audioop-lts==0.2.1
+# Telephony
+twilio>=9.6
 
-# Twilio
-twilio==9.6.3
-
-# Async HTTP client
-httpx==0.28.1
-aiohttp==3.11.18
+# Audio (audioop was removed from the stdlib in Python 3.13)
+audioop-lts>=0.2.1; python_version >= "3.13"
 
 # Structured logging
-structlog==25.3.0
+structlog>=25.3
