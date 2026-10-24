@@ -6,7 +6,7 @@ from pydantic import ValidationError
 from core.config import Settings
 from core.security import make_stream_token, verify_stream_token
 from services.ai_agent import sentences_from_stream
-from services.audio_stream import chunk_audio, mulaw_rms, strip_wav_header
+from services.audio_codec import chunk_audio, mulaw_rms, strip_wav_header
 
 
 def test_config_rejects_bad_sid(monkeypatch):

@@ -27,7 +27,15 @@ class Settings(BaseSettings):
     gemini_temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     gemini_max_output_tokens: int = Field(default=256, gt=0, le=8192)
 
-    # ── Speech (STT / TTS) ────────────────────────────────────────────────────
+    # ── Voice engine ──────────────────────────────────────────────────────────
+    # "live"    : Gemini Live native audio (audio in → audio out, lowest latency, server-side VAD/barge-in)
+    # "cascade" : Google STT → Gemini text → Google TTS (full control, used as automatic fallback)
+    voice_engine: Literal["live", "cascade"] = Field(default="live")
+    live_model: str = Field(default="gemini-live-2.5-flash-native-audio")
+    live_voice: str = Field(default="Aoede")
+    live_language_code: str = Field(default="fr-FR")
+
+    # ── Speech (STT / TTS, cascade engine) ────────────────────────────────────
     stt_language_code: str = Field(default="fr-FR")
     tts_language_code: str = Field(default="fr-FR")
     tts_voice_name: str = Field(default="fr-FR-Neural2-A")
@@ -49,11 +57,24 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field(default="INFO")
     public_base_url: str = Field(..., description="Publicly reachable base URL (https://…, no trailing slash)")
 
-    # ── Audio / barge-in ──────────────────────────────────────────────────────
+    # ── Call policy ───────────────────────────────────────────────────────────
+    max_call_seconds: int = Field(default=900, gt=0, description="Hard limit; the call is ended politely after this")
+    goodbye_grace_seconds: float = Field(default=8.0, gt=0, description="Max wait for goodbye audio before hanging up")
+    require_caller_verification: bool = Field(
+        default=False, description="Withhold history / account data until verify_caller succeeds"
+    )
+    max_verification_attempts: int = Field(default=3, ge=1)
+    firestore_collection_escalations: str = Field(default="escalations")
+
+    # ── Audio / barge-in (cascade engine) ──────────────────────────────────────────────────────
     # Twilio Media Streams are µ-law 8 kHz mono, 20 ms (160 bytes) per frame.
     barge_in_energy_threshold: int = Field(default=500, ge=0, le=32768)
     barge_in_min_frames: int = Field(
         default=3, ge=1, description="Consecutive loud 20 ms frames required to trigger barge-in"
+    )
+
+    barge_in_min_chars: int = Field(
+        default=3, ge=0, description="Interim transcript must have this many characters to interrupt (ignores 'mm')"
     )
 
     @field_validator("twilio_account_sid")

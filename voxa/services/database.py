@@ -96,3 +96,26 @@ async def append_call_summary(phone_number: str, summary: str, date: str) -> Non
         logger.info("call_summary_saved", phone=phone_number)
     except Exception as exc:
         logger.error("firestore_write_error", phone=phone_number, error=str(exc))
+
+
+async def create_escalation(call_sid: str, phone_number: str, reason: str) -> str | None:
+    """Record a human-callback request. Returns the document id, or None if the write failed."""
+    settings = get_settings()
+    try:
+        _, ref = await asyncio.wait_for(
+            _get_client().collection(settings.firestore_collection_escalations).add(
+                {
+                    "call_sid": call_sid,
+                    "phone": phone_number,
+                    "reason": reason,
+                    "status": "pending",
+                    "created_at": firestore.SERVER_TIMESTAMP,
+                }
+            ),
+            timeout=5.0,
+        )
+        logger.info("escalation_created", call_sid=call_sid, escalation_id=ref.id)
+        return ref.id
+    except Exception as exc:
+        logger.error("escalation_failed", call_sid=call_sid, error=str(exc))
+        return None
